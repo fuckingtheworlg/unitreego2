@@ -1,0 +1,172 @@
+#include <iostream>
+#include <stdint.h>
+#include <math.h>
+#include <unitree/robot/channel/channel_publisher.hpp>
+#include <unitree/robot/channel/channel_subscriber.hpp>
+#include <unitree/idl/go2/LowState_.hpp>
+#include <unitree/idl/go2/LowCmd_.hpp>
+#include <unitree/common/time/time_tool.hpp>
+#include <unitree/common/thread/thread.hpp>
+
+using namespace unitree::common;
+using namespace unitree::robot;
+
+#define TOPIC_LOWCMD   "rt/lowcmd"
+#define TOPIC_LOWSTATE "rt/lowstate"
+
+constexpr double PosStopF = 2.146E+9f;
+constexpr double VelStopF = 16000.0f;
+
+class SemiSquat
+{
+public:
+    explicit SemiSquat(const char* net_if)
+    {
+        ChannelFactory::Instance()->Init(0, net_if);
+        InitLowCmd();
+        lowcmd_pub_.reset(new ChannelPublisher<unitree_go::msg::dds_::LowCmd_>(TOPIC_LOWCMD));
+        lowcmd_pub_->InitChannel();
+        lowstate_sub_.reset(new ChannelSubscriber<unitree_go::msg::dds_::LowState_>(TOPIC_LOWSTATE));
+        lowstate_sub_->InitChannel(std::bind(&SemiSquat::lowstate_callback, this, std::placeholders::_1), 1);
+        // launch control thread at e.g. 2000 μs (500 Hz)
+        ctrl_thread_ = CreateRecurrentThreadEx("semi_squat_ctrl", UT_CPU_ID_NONE, 2000,
+                                               &SemiSquat::control_loop, this);
+    }
+
+    ~SemiSquat() = default;
+
+    void lowstate_callback(const void* msg)
+    {
+        low_state_ = *(unitree_go::msg::dds_::LowState_*) msg;
+    }
+
+private:
+    void InitLowCmd()
+    {
+        low_cmd_.head()[0] = 0xFE;
+        low_cmd_.head()[1] = 0xEF;
+        low_cmd_.level_flag() = 0xFF;
+        low_cmd_.gpio() = 0;
+        for(int i = 0; i < 20; i++) {
+            low_cmd_.motor_cmd()[i].mode() = 0x01;  // servo mode
+            low_cmd_.motor_cmd()[i].q()   = PosStopF;
+            low_cmd_.motor_cmd()[i].kp()  = 0;
+            low_cmd_.motor_cmd()[i].dq()  = VelStopF;
+            low_cmd_.motor_cmd()[i].kd()  = 0;
+            low_cmd_.motor_cmd()[i].tau() = 0;
+        }
+        // define your joint target indices for e.g. 12 motors
+        // here for simplicity assume leg joints indices 0‑2 (front right), etc
+        for(int j = 0; j < num_leg_joints_; j++) {
+            qInit_[j] = 0.0f;
+            qDes_[j]  = 0.0f;
+        }
+    }
+
+    void control_loop()
+    {
+        static int count = 0;
+        count++;
+
+        // after some initial delay, capture initial positions
+        if(count < init_cycles_) {
+            for(int j = 0; j < num_leg_joints_; j++) {
+                qInit_[j] = low_state_.motor_state()[ leg_joint_idx_[j] ].q();
+            }
+            return;
+        }
+
+        // transition phase
+        if(count < init_cycles_ + transition_cycles_) {
+            double rate = double(count - init_cycles_) / transition_cycles_;
+            for(int j = 0; j < num_leg_joints_; j++) {
+                qDes_[j] = qInit_[j] * (1.0 - rate) + target_squat_q_[j] * rate;
+            }
+        } else {
+            // steady squat posture
+            for(int j = 0; j < num_leg_joints_; j++) {
+                qDes_[j] = target_squat_q_[j];
+            }
+        }
+
+        // set commands
+        for(int j = 0; j < num_leg_joints_; j++) {
+            int idx = leg_joint_idx_[j];
+            auto &mc = low_cmd_.motor_cmd()[idx];
+            mc.mode() = 0x01;
+            mc.q()    = qDes_[j];
+            mc.dq()   = 0.0f;
+            mc.kp()   = kp_squat_[j];
+            mc.kd()   = kd_squat_[j];
+            mc.tau()  = 0.0f;
+        }
+
+        // CRC
+        uint32_t* ptr = (uint32_t*)&low_cmd_;
+        low_cmd_.crc() = crc32_core(ptr, (sizeof(unitree_go::msg::dds_::LowCmd_)>>2)-1);
+
+        lowcmd_pub_->Write(low_cmd_);
+    }
+
+    static uint32_t crc32_core(uint32_t* ptr, uint32_t len)
+    {
+        unsigned int xbit, data;
+        unsigned int CRC32 = 0xFFFFFFFF;
+        const unsigned int dwPolynomial = 0x04c11db7;
+        for(unsigned int i=0; i < len; i++){
+            xbit = 1 << 31;
+            data = ptr[i];
+            for(unsigned int bits=0; bits<32; bits++){
+                if(CRC32 & 0x80000000) {
+                    CRC32 <<= 1;
+                    CRC32 ^= dwPolynomial;
+                } else {
+                    CRC32 <<= 1;
+                }
+                if(data & xbit) CRC32 ^= dwPolynomial;
+                xbit >>= 1;
+            }
+        }
+        return CRC32;
+    }
+
+private:
+    ChannelPublisherPtr<unitree_go::msg::dds_::LowCmd_>   lowcmd_pub_;
+    ChannelSubscriberPtr<unitree_go::msg::dds_::LowState_> lowstate_sub_;
+    ThreadPtr ctrl_thread_;
+
+    unitree_go::msg::dds_::LowCmd_   low_cmd_;
+    unitree_go::msg::dds_::LowState_ low_state_;
+
+    static constexpr int num_leg_joints_ = 12;  // example: 12 motor joints
+    int leg_joint_idx_[num_leg_joints_] = {0,1,2, 3,4,5, 6,7,8, 9,10,11};  // adapt to your mapping
+
+    float qInit_[num_leg_joints_];
+    float qDes_[num_leg_joints_];
+    // define your target "squat" angles (rad) here
+    float target_squat_q_[num_leg_joints_] = {
+        /* joint0 */ 0.0f,
+        /* joint1 */ -0.2f,
+        /* joint2 */  0.4f,
+        // ...
+    };
+
+    float kp_squat_[num_leg_joints_] = {5.0f};
+    float kd_squat_[num_leg_joints_] = {1.0f};
+
+    int init_cycles_      = 100;   // first ~100 cycles capture init
+    int transition_cycles_= 500;   // next ~500 cycles transition
+};
+
+int main(int argc, const char** argv)
+{
+    if(argc < 2) {
+        std::cout << "Usage: " << argv[0] << " <networkInterface>\n";
+        return -1;
+    }
+    SemiSquat sq(argv[1]);
+    while(true) {
+        usleep(1000000);
+    }
+    return 0;
+}
