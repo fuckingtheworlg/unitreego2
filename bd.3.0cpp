@@ -1,0 +1,212 @@
+#include <iostream>
+#include <stdint.h>
+#include <math.h>
+#include <unitree/robot/channel/channel_publisher.hpp>
+#include <unitree/robot/channel/channel_subscriber.hpp>
+#include <unitree/idl/go2/LowState_.hpp>
+#include <unitree/idl/go2/LowCmd_.hpp>
+#include <unitree/common/time/time_tool.hpp>
+#include <unitree/common/thread/thread.hpp>
+
+using namespace unitree::common;
+using namespace unitree::robot;
+
+#define TOPIC_LOWCMD   "rt/lowcmd"
+#define TOPIC_LOWSTATE "rt/lowstate"
+
+constexpr double PosStopF = 2.146E+9f;
+constexpr double VelStopF = 16000.0f;
+
+enum ControlState {
+    STATE_SEMISQUAT = 0,
+    STATE_PROTECT,
+    STATE_AUTO_STANDUP
+};
+
+class SemiSquat
+{
+public:
+    explicit SemiSquat(const char* net_if)
+    {
+        ChannelFactory::Instance()->Init(0, net_if);
+        InitLowCmd();
+        lowcmd_pub_.reset(new ChannelPublisher<unitree_go::msg::dds_::LowCmd_>(TOPIC_LOWCMD));
+        lowcmd_pub_->InitChannel();
+        lowstate_sub_.reset(new ChannelSubscriber<unitree_go::msg::dds_::LowState_>(TOPIC_LOWSTATE));
+        lowstate_sub_->InitChannel(std::bind(&SemiSquat::lowstate_callback, this, std::placeholders::_1), 1);
+        ctrl_thread_ = CreateRecurrentThreadEx("semi_squat_ctrl", UT_CPU_ID_NONE, 2000,
+                                               &SemiSquat::control_loop, this);
+    }
+
+    ~SemiSquat() = default;
+
+private:
+    void lowstate_callback(const void* msg)
+    {
+        low_state_ = *(unitree_go::msg::dds_::LowState_*) msg;
+    }
+
+    void InitLowCmd()
+    {
+        low_cmd_.head()[0] = 0xFE;
+        low_cmd_.head()[1] = 0xEF;
+        low_cmd_.level_flag() = 0xFF;
+        for(int i = 0; i < 20; i++) {
+            auto &mc = low_cmd_.motor_cmd()[i];
+            mc.mode() = 0x01;
+            mc.q()   = PosStopF;
+            mc.dq()  = VelStopF;
+            mc.kp()  = 0;
+            mc.kd()  = 0;
+            mc.tau() = 0;
+        }
+        for(int j=0;j<num_leg_joints_;j++){ qInit_[j]=0;qDes_[j]=0; }
+    }
+
+    void control_loop()
+    {
+        static int count = 0;
+        count++;
+
+        float pitch = low_state_.imu_state().rpy()[1];
+        float roll  = low_state_.imu_state().rpy()[0];
+
+        bool is_fallen  = (fabs(pitch) > 1.2f || fabs(roll) > 1.2f);
+        bool is_upright = (fabs(pitch) < 0.5f && fabs(roll) < 0.5f);
+
+        switch(ctrl_state_)
+        {
+            case STATE_SEMISQUAT:
+                if(is_fallen){
+                    ctrl_state_ = STATE_PROTECT;
+                    std::cout << "[WARN] Fallen detected → PROTECT\n";
+                } else {
+                    maintain_squat();
+                }
+                break;
+
+            case STATE_PROTECT:
+                stop_all_motors();
+                if(is_upright){
+                    ctrl_state_ = STATE_AUTO_STANDUP;
+                    standup_counter_ = 0;
+                    std::cout << "[INFO] Upright recovered → AUTO STANDUP\n";
+                }
+                break;
+
+            case STATE_AUTO_STANDUP:
+                if(perform_standup()){
+                    ctrl_state_ = STATE_SEMISQUAT;
+                    std::cout << "[INFO] Stand-up done → SEMISQUAT\n";
+                }
+                break;
+        }
+    }
+
+    // === 半蹲保持 ===
+    void maintain_squat()
+    {
+        for(int j=0;j<num_leg_joints_;j++){
+            int idx = leg_joint_idx_[j];
+            auto &mc = low_cmd_.motor_cmd()[idx];
+            mc.mode() = 0x01;
+            mc.q()    = target_squat_q_[j];
+            mc.dq()   = 0.0f;
+            mc.kp()   = kp_hold_;
+            mc.kd()   = kd_hold_;
+            mc.tau()  = 0.0f;
+        }
+        publish_cmd();
+    }
+
+    // === 自动站起插值 ===
+    bool perform_standup()
+    {
+        standup_counter_++;
+        double rate = std::min(1.0, standup_counter_ / double(standup_cycles_));
+
+        for(int j=0;j<num_leg_joints_;j++)
+            qDes_[j] = target_stand_q_[j] * rate + target_squat_q_[j] * (1.0 - rate);
+
+        for(int j=0;j<num_leg_joints_;j++){
+            int idx = leg_joint_idx_[j];
+            auto &mc = low_cmd_.motor_cmd()[idx];
+            mc.mode() = 0x01;
+            mc.q()    = qDes_[j];
+            mc.dq()   = 0.0f;
+            mc.kp()   = kp_stand_;
+            mc.kd()   = kd_stand_;
+            mc.tau()  = 0.0f;
+        }
+        publish_cmd();
+        return (rate >= 1.0);
+    }
+
+    void stop_all_motors()
+    {
+        for(int i=0;i<12;i++){
+            auto &mc = low_cmd_.motor_cmd()[i];
+            mc.q()=PosStopF; mc.dq()=VelStopF; mc.kp()=0; mc.kd()=0; mc.tau()=0;
+        }
+        publish_cmd();
+    }
+
+    void publish_cmd()
+    {
+        uint32_t* ptr = (uint32_t*)&low_cmd_;
+        low_cmd_.crc() = crc32_core(ptr,(sizeof(unitree_go::msg::dds_::LowCmd_)>>2)-1);
+        lowcmd_pub_->Write(low_cmd_);
+    }
+
+    static uint32_t crc32_core(uint32_t* ptr,uint32_t len)
+    {
+        unsigned int xbit,data,CRC32=0xFFFFFFFF;
+        const unsigned int poly=0x04c11db7;
+        for(unsigned int i=0;i<len;i++){
+            xbit=1<<31; data=ptr[i];
+            for(unsigned int b=0;b<32;b++){
+                if(CRC32 & 0x80000000){ CRC32<<=1; CRC32^=poly; }
+                else CRC32<<=1;
+                if(data & xbit) CRC32^=poly;
+                xbit>>=1;
+            }
+        }
+        return CRC32;
+    }
+
+private:
+    ChannelPublisherPtr<unitree_go::msg::dds_::LowCmd_>   lowcmd_pub_;
+    ChannelSubscriberPtr<unitree_go::msg::dds_::LowState_> lowstate_sub_;
+    ThreadPtr ctrl_thread_;
+    unitree_go::msg::dds_::LowCmd_   low_cmd_;
+    unitree_go::msg::dds_::LowState_ low_state_;
+
+    static constexpr int num_leg_joints_=12;
+    int leg_joint_idx_[num_leg_joints_]={0,1,2,3,4,5,6,7,8,9,10,11};
+    float qInit_[num_leg_joints_], qDes_[num_leg_joints_];
+
+    float target_squat_q_[num_leg_joints_]={
+        0.0f,-0.25f,0.45f, 0.0f,-0.25f,0.45f,
+        0.0f,-0.25f,0.45f, 0.0f,-0.25f,0.45f};
+    float target_stand_q_[num_leg_joints_]={
+        0.0f,0.0f,0.0f, 0.0f,0.0f,0.0f,
+        0.0f,0.0f,0.0f, 0.0f,0.0f,0.0f};
+
+    float kp_hold_=3.0f, kd_hold_=2.5f;
+    float kp_stand_=3.5f, kd_stand_=2.0f;
+
+    int standup_counter_=0;
+    int standup_cycles_=800;
+    ControlState ctrl_state_=STATE_SEMISQUAT;
+};
+
+int main(int argc,const char** argv)
+{
+    if(argc<2){
+        std::cout<<"Usage: "<<argv[0]<<" <networkInterface>\n";
+        return -1;
+    }
+    SemiSquat sq(argv[1]);
+    while(true){ usleep(1000000); }
+    return 0;
+}
